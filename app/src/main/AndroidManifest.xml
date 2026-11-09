@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Allow querying KEXP package version so Watchdog knows when KEXP updates -->
+    <queries>
+        <package android:name="org.kexp.android" />
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:label="KEXP → Spotify Sync"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <!-- Main Dashboard & Spotify OAuth PKCE Callback Receiver -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Spotify PKCE Redirect URI: kexpspotifysync://callback -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:host="callback"
+                    android:scheme="kexpspotifysync" />
+            </intent-filter>
+        </activity>
+
+        <!-- Share-Sheet Receiver for KEXP's native "Share / Export Favorites" feature -->
+        <activity
+            android:name=".ShareImportActivity"
+            android:exported="true"
+            android:label="Sync KEXP Favorites to Spotify"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/csv" />
+                <data android:mimeType="text/comma-separated-values" />
+            </intent-filter>
+        </activity>
+
+        <!-- 1. MediaSession Listener (Handles Android Auto & Notification Heart taps + Watchdog) -->
+        <service
+            android:name=".service.KexpMediaNotificationListener"
+            android:exported="true"
+            android:label="KEXP Media &amp; Android Auto Sync"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- 2. Scoped UI Accessibility Listener (Strictly filtered to org.kexp.android for zero battery drain) -->
+        <service
+            android:name=".service.KexpUiAccessibilityService"
+            android:exported="true"
+            android:label="KEXP In-App Heart Detector"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+    </application>
+
+</manifest>

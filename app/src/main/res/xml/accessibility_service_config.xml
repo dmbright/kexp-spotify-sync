@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  BATTERY OPTIMIZATION:
+  1. packageNames="org.kexp.android" instructs the Android OS kernel/system server
+     NEVER to wake this service when any other app is on screen.
+  2. accessibilityEventTypes="typeViewClicked|typeViewSelected" only fires on explicit user taps,
+     never on scroll, text change, or window animation frames.
+  3. notificationTimeout="150" coalesces rapid events.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewClicked|typeViewSelected|typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="150"
+    android:packageNames="org.kexp.android" />

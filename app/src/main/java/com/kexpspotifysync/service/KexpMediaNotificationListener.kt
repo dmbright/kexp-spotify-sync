@@ -42,11 +42,10 @@ class KexpMediaNotificationListener : NotificationListenerService() {
     private var mediaSessionManager: MediaSessionManager? = null
     private var activeKexpController: MediaController? = null
 
-    // Snapshot of the previous CustomActions (actionId -> iconResId) so we can detect state transitions
-    // when the user taps the Heart on Android Auto or the Media Notification
-    private val previousActionIcons = mutableMapOf<String, Int>()
-    private val previousActionNames = mutableMapOf<String, String>()
-    private val previousActionExtras = mutableMapOf<String, String>()
+    // Track the most recent non-BLANK Favorite custom action state (because KEXP's audio service
+    // changes the action ID itself between "NOT_FAVORITE", "FAVORITE", and "BLANK" on airbreaks!)
+    private var lastFavoriteStateName: String? = null
+    private var lastFavoriteStateIcon: Int = 0
     private var lastRatingWasRated = false
     private var watchdogAlertedForCurrentSession = false
 
@@ -133,9 +132,8 @@ class KexpMediaNotificationListener : NotificationListenerService() {
         } catch (_: Exception) {
         }
         activeKexpController = null
-        previousActionIcons.clear()
-        previousActionNames.clear()
-        previousActionExtras.clear()
+        lastFavoriteStateName = null
+        lastFavoriteStateIcon = 0
         lastRatingWasRated = false
     }
 
@@ -153,11 +151,15 @@ class KexpMediaNotificationListener : NotificationListenerService() {
         }
 
         val state = controller.playbackState ?: return
-        for (ca in state.customActions) {
-            previousActionIcons[ca.action] = ca.icon
-            previousActionNames[ca.action] = ca.name?.toString() ?: ""
-            previousActionExtras[ca.action] = bundleToSignature(ca.extras)
-            if (ca.name?.toString()?.trim().equals("Favorite", ignoreCase = true)) {
+        val learnedId = SyncPreferences.getLearnedMediaActionId(this)
+        val favAction = state.customActions.firstOrNull { ca ->
+            isFavoriteCustomAction(ca.action, ca.name?.toString() ?: "", learnedId)
+        }
+        if (favAction != null) {
+            val name = favAction.name?.toString()?.trim() ?: ""
+            lastFavoriteStateName = name
+            lastFavoriteStateIcon = favAction.icon
+            if (name.equals("Favorite", ignoreCase = true)) {
                 val (a, t, _) = SyncPreferences.getCurrentPlayingTrack(this)
                 if (a.isNotEmpty() && t.isNotEmpty()) {
                     SyncPreferences.markKnownKexpFavorites(this, listOf(a to t))
@@ -187,12 +189,16 @@ class KexpMediaNotificationListener : NotificationListenerService() {
 
         if (trackChanged) {
             lastRatingWasRated = isNowLiked
-            // Snapshot current custom action icons for the new track so un-hearting on track change doesn't trigger a like
-            activeKexpController?.playbackState?.customActions?.forEach { ca ->
-                previousActionIcons[ca.action] = ca.icon
-                previousActionNames[ca.action] = ca.name?.toString() ?: ""
-                previousActionExtras[ca.action] = bundleToSignature(ca.extras)
-                if (ca.name?.toString()?.trim().equals("Favorite", ignoreCase = true) &&
+            // Snapshot current custom action state for the new track so un-hearting on track change doesn't trigger a like
+            val learnedId = SyncPreferences.getLearnedMediaActionId(this)
+            val favAction = activeKexpController?.playbackState?.customActions?.firstOrNull { ca ->
+                isFavoriteCustomAction(ca.action, ca.name?.toString() ?: "", learnedId)
+            }
+            if (favAction != null) {
+                val name = favAction.name?.toString()?.trim() ?: ""
+                lastFavoriteStateName = name
+                lastFavoriteStateIcon = favAction.icon
+                if (name.equals("Favorite", ignoreCase = true) &&
                     artist.isNotEmpty() && track.isNotEmpty()
                 ) {
                     SyncPreferences.markKnownKexpFavorites(this, listOf(artist to track))
@@ -224,82 +230,94 @@ class KexpMediaNotificationListener : NotificationListenerService() {
         val learnedActionId = SyncPreferences.getLearnedMediaActionId(this)
         val learnedFavIconRes = SyncPreferences.getLearnedFavoritedIconRes(this)
 
-        for (ca in state.customActions) {
-            val actionId = ca.action
-            val currentIcon = ca.icon
-            val currentName = ca.name?.toString() ?: ""
-            val currentExtrasSig = bundleToSignature(ca.extras)
+        // Find the active Favorite custom action across the session (even if its actionId changed
+        // between "NOT_FAVORITE" and "FAVORITE"!)
+        val favAction = state.customActions.firstOrNull { ca ->
+            !ca.action.equals("BLANK", ignoreCase = true) &&
+                !ca.name.toString().equals("Blank", ignoreCase = true) &&
+                isFavoriteCustomAction(ca.action, ca.name?.toString() ?: "", learnedActionId)
+        } ?: return
 
-            val prevIcon = previousActionIcons[actionId]
-            val prevName = previousActionNames[actionId]
-            val prevExtrasSig = previousActionExtras[actionId]
+        val actionId = favAction.action
+        val currentIcon = favAction.icon
+        val currentName = favAction.name?.toString()?.trim() ?: ""
 
-            val stateChanged = (prevIcon != null && prevIcon != currentIcon) ||
-                (prevName != null && prevName != currentName) ||
-                (prevExtrasSig != null && prevExtrasSig != currentExtrasSig)
+        val prevName = lastFavoriteStateName
+        val prevIcon = lastFavoriteStateIcon
 
-            // 1. If Re-Learn mode is active and the user just tapped a button that changed state:
-            if (relearnMode && stateChanged) {
-                SyncPreferences.setLearnedMediaActionId(this, actionId, currentIcon)
-                NotificationHelper.notifySyncSuccess(
-                    this,
-                    artist = "Learned Action: $actionId",
-                    track = "Icon $prevIcon → $currentIcon",
-                    source = "Self-Heal Complete"
-                )
-                triggerSyncFromActiveSession("Android Auto / Re-Learned Action")
-            } else if (stateChanged && isFavoriteCustomAction(actionId, currentName, learnedActionId)) {
-                // 2. Normal operation: A favorite custom action transitioned state!
-                // KEXP's MediaSession CustomAction uses:
-                //   mName="Not Favorite" (icon=2131230894) when the track is NOT favorited
-                //   mName="Favorite"     (icon=2131230893) when the track IS favorited
-                val nameLower = currentName.trim().lowercase()
-                val prevNameLower = (prevName ?: "").trim().lowercase()
+        // Update snapshot for next event
+        lastFavoriteStateName = currentName
+        lastFavoriteStateIcon = currentIcon
 
-                val transitionedToUnfavorited = nameLower == "not favorite" ||
-                    nameLower.startsWith("not fav") ||
-                    ca.extras?.getBoolean("is_favorite", true) == false ||
-                    ca.extras?.getBoolean("favorited", true) == false
+        // If we had no prior state yet (e.g. session just started or just exited an Air Break),
+        // seed the state without false-triggering, unless it's already "Favorite" on a brand-new tap
+        if (prevName == null) {
+            return
+        }
 
-                val transitionedToFavorited = (nameLower == "favorite" && prevNameLower != "favorite") ||
-                    ca.extras?.getBoolean("is_favorite", false) == true ||
-                    ca.extras?.getBoolean("favorited", false) == true ||
-                    (learnedFavIconRes != 0 && currentIcon == learnedFavIconRes)
+        val stateChanged = (!prevName.equals(currentName, ignoreCase = true)) ||
+            (prevIcon != 0 && prevIcon != currentIcon)
 
-                val (artist, track, album) = SyncPreferences.getCurrentPlayingTrack(this)
+        if (!stateChanged) return
 
-                when {
-                    transitionedToUnfavorited -> {
-                        // Only remove from Spotify if our app had previously liked it;
-                        // if it was pre-liked before installing the app, do nothing!
-                        if (SyncPreferences.hasAlreadyLiked(this, artist, track)) {
-                            SpotifyTrackSyncer.triggerUnlikeSync(this, artist, track, album, "Android Auto / MediaSession")
-                        }
-                    }
-                    transitionedToFavorited -> {
-                        SpotifyTrackSyncer.triggerHeartSync(
-                            this,
-                            artist,
-                            track,
-                            album,
-                            source = "Android Auto / MediaSession"
-                        )
-                    }
-                    else -> {
-                        SpotifyTrackSyncer.triggerToggleHeartSync(
-                            this,
-                            artist,
-                            track,
-                            album,
-                            source = "Android Auto / MediaSession"
-                        )
-                    }
+        // 1. If Re-Learn mode is active and the user just tapped a button that changed state:
+        if (relearnMode) {
+            SyncPreferences.setLearnedMediaActionId(this, actionId, currentIcon)
+            NotificationHelper.notifySyncSuccess(
+                this,
+                artist = "Learned Action: $actionId",
+                track = "$prevName ($prevIcon) → $currentName ($currentIcon)",
+                source = "Self-Heal Complete"
+            )
+            triggerSyncFromActiveSession("Android Auto / Re-Learned Action")
+            return
+        }
+
+        // 2. Normal operation: KEXP's Favorite CustomAction transitioned state!
+        // KEXP's MediaSession CustomAction uses:
+        //   mName="Not Favorite" (icon=2131230894) when the track is NOT favorited
+        //   mName="Favorite"     (icon=2131230893) when the track IS favorited
+        val nameLower = currentName.lowercase()
+        val prevNameLower = prevName.lowercase()
+
+        val transitionedToUnfavorited = nameLower == "not favorite" ||
+            nameLower.startsWith("not fav") ||
+            favAction.extras?.getBoolean("is_favorite", true) == false ||
+            favAction.extras?.getBoolean("favorited", true) == false
+
+        val transitionedToFavorited = (nameLower == "favorite" && prevNameLower != "favorite") ||
+            favAction.extras?.getBoolean("is_favorite", false) == true ||
+            favAction.extras?.getBoolean("favorited", false) == true ||
+            (learnedFavIconRes != 0 && currentIcon == learnedFavIconRes)
+
+        val (artist, track, album) = SyncPreferences.getCurrentPlayingTrack(this)
+
+        when {
+            transitionedToUnfavorited -> {
+                if (SyncPreferences.hasAlreadyLiked(this, artist, track)) {
+                    SpotifyTrackSyncer.triggerUnlikeSync(this, artist, track, album, "Android Auto / MediaSession")
+                } else {
+                    SyncPreferences.removeKnownKexpFavorite(this, artist, track)
                 }
             }
-
-            previousActionIcons[actionId] = currentIcon
-            previousActionNames[actionId] = currentName
-            previousActionExtras[actionId] = currentExtrasSig
+            transitionedToFavorited -> {
+                SpotifyTrackSyncer.triggerHeartSync(
+                    this,
+                    artist,
+                    track,
+                    album,
+                    source = "Android Auto / MediaSession"
+                )
+            }
+            else -> {
+                SpotifyTrackSyncer.triggerToggleHeartSync(
+                    this,
+                    artist,
+                    track,
+                    album,
+                    source = "Android Auto / MediaSession"
+                )
+            }
         }
     }
 
@@ -348,7 +366,11 @@ class KexpMediaNotificationListener : NotificationListenerService() {
         val supportsRating = activeKexpController?.metadata
             ?.containsKey(MediaMetadata.METADATA_KEY_USER_RATING) == true
 
-        val isHealthy = matchedAction != null || supportsRating || state.customActions.isEmpty()
+        // Check if KEXP is currently on a DJ Air Break (where KEXP sets CustomAction to "BLANK")
+        val isAirbreakBlank = state.customActions.size == 1 &&
+            state.customActions[0].action.equals("BLANK", ignoreCase = true)
+
+        val isHealthy = matchedAction != null || supportsRating || state.customActions.isEmpty() || isAirbreakBlank
 
         val warning = if (!isHealthy) {
             "KEXP ($kexpVersion) is playing audio with CustomActions $actionIds, " +

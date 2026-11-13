@@ -8,6 +8,8 @@ import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import com.kexpspotifysync.data.SyncPreferences
@@ -48,6 +50,8 @@ class KexpMediaNotificationListener : NotificationListenerService() {
     private var lastFavoriteStateIcon: Int = 0
     private var lastRatingWasRated = false
     private var watchdogAlertedForCurrentSession = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingUnlikeRunnable: Runnable? = null
 
     private val sessionsChangedListener =
         MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
@@ -188,6 +192,10 @@ class KexpMediaNotificationListener : NotificationListenerService() {
         val isNowLiked = userRating?.hasHeart() == true || userRating?.isThumbUp == true
 
         if (trackChanged) {
+            // Cancel any pending "Not Favorite" unlike that KEXP fired milliseconds before updating track metadata!
+            pendingUnlikeRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingUnlikeRunnable = null
+
             lastRatingWasRated = isNowLiked
             // Snapshot current custom action state for the new track so un-hearting on track change doesn't trigger a like
             val learnedId = SyncPreferences.getLearnedMediaActionId(this)
@@ -294,13 +302,30 @@ class KexpMediaNotificationListener : NotificationListenerService() {
 
         when {
             transitionedToUnfavorited -> {
-                if (SyncPreferences.hasAlreadyLiked(this, artist, track)) {
-                    SpotifyTrackSyncer.triggerUnlikeSync(this, artist, track, album, "Android Auto / MediaSession")
-                } else {
-                    SyncPreferences.removeKnownKexpFavorite(this, artist, track)
+                // IMPORTANT: When a song finishes playing on KEXP, KEXP resets the CustomAction from
+                // "Favorite" -> "Not Favorite" right BEFORE firing onMetadataChanged for the next track!
+                // We wait 2,000ms and verify that the SAME track is still playing before unliking on Spotify.
+                pendingUnlikeRunnable?.let { mainHandler.removeCallbacks(it) }
+                val runnable = Runnable {
+                    pendingUnlikeRunnable = null
+                    val (currentArtistNow, currentTrackNow, _) = SyncPreferences.getCurrentPlayingTrack(this)
+                    val sameTrackStillPlaying = currentArtistNow.equals(artist, ignoreCase = true) &&
+                        currentTrackNow.equals(track, ignoreCase = true)
+
+                    if (sameTrackStillPlaying) {
+                        if (SyncPreferences.hasAlreadyLiked(this, artist, track)) {
+                            SpotifyTrackSyncer.triggerUnlikeSync(this, artist, track, album, "Android Auto / MediaSession")
+                        } else {
+                            SyncPreferences.removeKnownKexpFavorite(this, artist, track)
+                        }
+                    }
                 }
+                pendingUnlikeRunnable = runnable
+                mainHandler.postDelayed(runnable, 2000L)
             }
             transitionedToFavorited -> {
+                pendingUnlikeRunnable?.let { mainHandler.removeCallbacks(it) }
+                pendingUnlikeRunnable = null
                 SpotifyTrackSyncer.triggerHeartSync(
                     this,
                     artist,
